@@ -1,0 +1,405 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import Image from "next/image";
+
+type JobStatus = "Planned" | "In Transit" | "Completed" | "Unassigned";
+
+type Job = {
+  id: string;
+  type: "Pickup" | "Delivery";
+  from: string;
+  to: string;
+  batteries: number;
+  weight: number;
+  status: JobStatus;
+  vehicle: string;
+};
+
+const initialJobs: Job[] = [
+  { id: "JOB-1001", type: "Pickup", from: "BRC Noida", to: "Dealer A",
+    batteries: 18, weight: 360, status: "Planned", vehicle: "MH-01" },
+  { id: "JOB-1002", type: "Delivery", from: "BRC Ghaziabad", to: "Dealer B",
+    batteries: 12, weight: 240, status: "In Transit", vehicle: "MH-02" },
+  { id: "JOB-1003", type: "Pickup", from: "Dealer C", to: "BRC Noida",
+    batteries: 24, weight: 480, status: "Unassigned", vehicle: "—" },
+  { id: "JOB-1004", type: "Delivery", from: "BRC Noida", to: "Dealer D",
+    batteries: 10, weight: 200, status: "Planned", vehicle: "MH-01" },
+  { id: "JOB-1005", type: "Pickup", from: "Dealer E", to: "BRC Ghaziabad",
+    batteries: 8, weight: 160, status: "Completed", vehicle: "MH-03" },
+];
+
+const initialVehicles = [
+  { id: "MH-01", name: "Vehicle 01", capacity: 1500, load: 560, state: "On route", km: 42 },
+  { id: "MH-02", name: "Vehicle 02", capacity: 1200, load: 240, state: "On route", km: 31 },
+  { id: "MH-03", name: "Vehicle 03", capacity: 1000, load: 160, state: "Available", km: 0 },
+];
+
+const navItems = [
+  ["Overview", "▦"],
+  ["Daily Planning", "↗"],
+  ["Live Operations", "⌖"],
+  ["Vehicles & Batteries", "▤"],
+  ["Route Analysis", "⇄"],
+  ["Reports", "▥"],
+] as const;
+
+function Status({ value }: { value: string }) {
+  const styles: Record<string, string> = {
+    Planned: "blue",
+    "In Transit": "amber",
+    Completed: "green",
+    Unassigned: "red",
+    "On route": "amber",
+    Available: "green",
+    Resolved: "green",
+  };
+  return <span className={`status ${styles[value] || "blue"}`}>{value}</span>;
+}
+
+export default function Home() {
+  const [active, setActive] = useState("Overview");
+  const [jobs, setJobs] = useState<Job[]>(initialJobs);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("All");
+  const [optimized, setOptimized] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  const vehicles = useMemo(() => {
+    return initialVehicles.map((v) => {
+      const load = jobs
+        .filter((j) => j.vehicle === v.id && j.status !== "Completed")
+        .reduce((sum, j) => sum + j.weight, 0);
+      return { ...v, load };
+    });
+  }, [jobs]);
+
+  const filteredJobs = jobs.filter((j) => {
+    const matchesQuery = `${j.id} ${j.from} ${j.to} ${j.vehicle}`
+      .toLowerCase()
+      .includes(query.toLowerCase());
+    return matchesQuery && (filter === "All" || j.status === filter);
+  });
+
+  const completed = jobs.filter((j) => j.status === "Completed").length;
+  const unassigned = jobs.filter((j) => j.status === "Unassigned").length;
+  const activeJobs = jobs.filter((j) => j.status !== "Completed").length;
+
+  function runDemoOptimization() {
+    // Demo only: assign unassigned jobs to the vehicle with the most spare capacity.
+    // Loads are tracked locally so jobs assigned earlier in this pass count.
+    const loads: Record<string, number> = Object.fromEntries(
+      vehicles.map((v) => [v.id, v.load])
+    );
+
+    const nextJobs: Job[] = jobs.map((job) => {
+      if (job.status !== "Unassigned") return job;
+
+      const candidate = vehicles
+        .map((v) => ({ id: v.id, remaining: v.capacity - loads[v.id] }))
+        .filter((v) => v.remaining >= job.weight)
+        .sort((a, b) => b.remaining - a.remaining)[0];
+
+      if (!candidate) return job;
+
+      loads[candidate.id] += job.weight;
+      return { ...job, vehicle: candidate.id, status: "Planned" };
+    });
+
+    const stillUnassigned = nextJobs.filter((j) => j.status === "Unassigned").length;
+
+    setJobs(nextJobs);
+    setOptimized(true);
+    setNotice(
+      stillUnassigned
+        ? `Demo plan updated, but ${stillUnassigned} job(s) don't fit any vehicle. OR-Tools is not connected yet.`
+        : "Demo plan updated. Review assignments and capacity before approving. OR-Tools is not connected yet."
+    );
+    setActive("Daily Planning");
+  }
+
+  function resetDemo() {
+    setJobs(initialJobs);
+    setOptimized(false);
+    setNotice("Demo data restored.");
+  }
+
+  function completeJob(id: string) {
+    setJobs((current) =>
+      current.map((job) =>
+        job.id === id ? { ...job, status: "Completed" } : job
+      )
+    );
+    setNotice(`${id} marked completed in the demo.`);
+  }
+
+  return (
+    <main className="shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <Image
+            src="/Motivus%20Logo.png"
+            alt="Motivus"
+            width={180}
+            height={75}
+            priority
+            className="object-contain"
+          />
+        </div>
+
+        <div className="workspace-label">WORKSPACE</div>
+        <nav>
+          {navItems.map(([label, icon]) => (
+            <button
+              key={label}
+              className={`nav-item ${active === label ? "selected" : ""}`}
+              onClick={() => {
+                setActive(label);
+                setNotice("");
+              }}
+            >
+              <span className="nav-icon">{icon}</span>
+              {label}
+              {label === "Live Operations" && <span className="live-dot" />}
+            </button>
+          ))}
+        </nav>
+
+        <div className="sidebar-bottom">
+          <div className="demo-label"><span /> DEMO ENVIRONMENT</div>
+          <div className="user">
+            <div className="avatar">AS</div>
+            <div><strong>Operations Admin</strong><span>Administrator</span></div>
+            <span className="user-menu">···</span>
+          </div>
+        </div>
+      </aside>
+
+      <section className="main-area">
+        <header className="topbar">
+          <div className="breadcrumb">Workspace <span>/</span> {active}</div>
+          <div className="top-actions">
+            <span className="demo-pill">● Synthetic data</span>
+            <button className="icon-button" title="Notifications">♧</button>
+            <div className="avatar small">AS</div>
+          </div>
+        </header>
+
+        <div className="content">
+          <div className="page-heading">
+            <div>
+              <div className="eyebrow">OPERATIONS CENTER / INDIA</div>
+              <h1>{active}</h1>
+              <p className="subtitle">
+                Manage daily battery movement, vehicle allocation and delivery operations.
+              </p>
+            </div>
+            <div className="heading-actions">
+              <button className="button secondary" onClick={resetDemo}>↻ Reset demo</button>
+              <button className="button primary" onClick={runDemoOptimization}>
+                ✦ Optimize plan
+              </button>
+            </div>
+          </div>
+
+          {notice && (
+            <div className="notice">
+              <span>ⓘ</span> {notice}
+              <button onClick={() => setNotice("")}>×</button>
+            </div>
+          )}
+
+          <div className="date-row">
+            <div className="date-chip">▦ &nbsp; Wednesday, 21 October 2026</div>
+            <span className="plan-status"><span /> Planning workspace</span>
+          </div>
+
+          <div className="metrics">
+            <Metric label="Total jobs" value={String(jobs.length).padStart(2, "0")}
+              note="Today's operational plan" icon="▤" tone="blue" />
+            <Metric label="Active vehicles" value="03"
+              note="2 on route · 1 available" icon="▣" tone="purple" />
+            <Metric label="Jobs completed" value={`${completed}/${jobs.length}`}
+              note={`${Math.round((completed / jobs.length) * 100)}% completion`} icon="✓" tone="green" />
+            <Metric label="Unassigned jobs" value={String(unassigned).padStart(2, "0")}
+              note="Require allocation" icon="⚑" tone="orange" />
+          </div>
+
+          <div className="section-grid">
+            <section className="panel route-panel">
+              <div className="panel-header">
+                <div><h2>Network overview</h2><p>Illustrative regional movement</p></div>
+                <span className="live-tag"><span /> DEMO MAP</span>
+              </div>
+
+              <div className="map-canvas">
+                <div className="map-grid" />
+                <svg className="route-svg" viewBox="0 0 600 320" preserveAspectRatio="none">
+                  <path d="M 80 220 C 150 200 140 100 235 110 S 350 240 435 175 S 510 80 550 90"
+                    className="route-line route-one" />
+                  <path d="M 80 220 C 180 270 230 235 315 220 S 400 120 435 175"
+                    className="route-line route-two" />
+                  <path d="M 235 110 Q 290 55 360 72 T 550 90" className="route-line route-three" />
+                </svg>
+                {[
+                  { name: "BRC Noida", x: 13, y: 66, cls: "hub" },
+                  { name: "BRC Ghaziabad", x: 39, y: 33, cls: "hub" },
+                  { name: "Dealer A", x: 73, y: 52, cls: "" },
+                  { name: "Dealer B", x: 53, y: 70, cls: "" },
+                  { name: "Dealer C", x: 86, y: 25, cls: "" },
+                ].map((p) => (
+                  <div key={p.name} className="map-point" style={{ left: `${p.x}%`, top: `${p.y}%` }}>
+                    <span className={`point-dot ${p.cls}`} />
+                    <span className="point-label">{p.name}</span>
+                  </div>
+                ))}
+                <div className="map-legend">
+                  <span><i className="legend-hub" /> BRC</span>
+                  <span><i className="legend-dealer" /> Pickup / delivery</span>
+                  <span><i className="legend-route" /> Planned route</span>
+                </div>
+                <div className="map-disclaimer">Illustrative map · Not geographic coordinates</div>
+              </div>
+
+              <div className="route-summary">
+                <div><span>Planned distance</span><strong>186 km</strong></div>
+                <div><span>Estimated duration</span><strong>4h 35m</strong></div>
+                <div><span>Route coverage</span><strong>80%</strong></div>
+              </div>
+            </section>
+
+            <section className="panel vehicle-panel">
+              <div className="panel-header">
+                <div><h2>Fleet status</h2><p>Vehicle payload utilization</p></div>
+                <button className="text-button" onClick={() => setActive("Vehicles & Batteries")}>
+                  View fleet →
+                </button>
+              </div>
+              <div className="vehicle-list">
+                {vehicles.map((v) => {
+                  const pct = Math.min(100, Math.round((v.load / v.capacity) * 100));
+                  return (
+                    <div className="vehicle-card" key={v.id}>
+                      <div className="vehicle-top">
+                        <div className="vehicle-symbol">▰</div>
+                        <div className="vehicle-info">
+                          <strong>{v.name}</strong><span>{v.id}</span>
+                        </div>
+                        <Status value={v.state} />
+                      </div>
+                      <div className="capacity-label">
+                        <span>Payload utilization</span>
+                        <strong>{pct}%</strong>
+                      </div>
+                      <div className="progress"><span style={{ width: `${pct}%` }} /></div>
+                      <div className="capacity-foot">
+                        <span>{v.load.toLocaleString()} kg loaded</span>
+                        <span>{v.capacity.toLocaleString()} kg capacity</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          </div>
+
+          <section className="panel jobs-panel">
+            <div className="panel-header jobs-header">
+              <div><h2>Today&apos;s pickup &amp; delivery jobs</h2><p>Review allocations and job status</p></div>
+              <button
+                className="button secondary small-button"
+                onClick={() => setNotice("CSV export will be enabled in a later integration phase.")}
+              >
+                ↓ Export
+              </button>
+            </div>
+
+            <div className="table-tools">
+              <div className="search-box"><span>⌕</span>
+                <input value={query} onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search job, location or vehicle..." />
+              </div>
+              <select value={filter} onChange={(e) => setFilter(e.target.value)}>
+                {["All", "Planned", "In Transit", "Completed", "Unassigned"].map((s) => (
+                  <option key={s}>{s}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>JOB ID</th><th>TYPE</th><th>PICKUP / ORIGIN</th>
+                    <th>DELIVERY / DESTINATION</th><th>BATTERIES</th>
+                    <th>TOTAL WEIGHT</th><th>VEHICLE</th><th>STATUS</th><th>ACTION</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredJobs.map((j) => (
+                    <tr key={j.id}>
+                      <td className="job-id">{j.id}</td>
+                      <td><span className={`job-type ${j.type.toLowerCase()}`}>{j.type}</span></td>
+                      <td>{j.from}</td><td>{j.to}</td>
+                      <td>{j.batteries}</td><td>{j.weight} kg</td>
+                      <td>{j.vehicle}</td><td><Status value={j.status} /></td>
+                      <td>
+                        {j.status !== "Completed" && (
+                          <button className="row-action" title="Mark completed"
+                            onClick={() => completeJob(j.id)}>✓</button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {filteredJobs.length === 0 && (
+                    <tr><td colSpan={9} className="empty">No jobs match this filter.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="table-footer">
+              Showing {filteredJobs.length} of {jobs.length} sample jobs
+              <span>Demo records only · Not live company data</span>
+            </div>
+          </section>
+
+          <div className="bottom-grid">
+            <section className="panel">
+              <div className="panel-header"><div><h2>Operational alerts</h2><p>Items requiring attention</p></div></div>
+              <div className="alert-item">
+                <span className="alert-icon warning">!</span>
+                <div><strong>Unassigned pickup job</strong><p>JOB-1003 · Dealer C · 480 kg</p></div>
+                <Status value={unassigned ? "Unassigned" : "Resolved"} />
+              </div>
+              <div className="alert-item">
+                <span className="alert-icon info">i</span>
+                <div><strong>Tracking is simulated</strong><p>No real GPS or traffic feed connected.</p></div>
+              </div>
+            </section>
+            <section className="panel">
+              <div className="panel-header"><div><h2>Optimization summary</h2><p>Latest demo action</p></div></div>
+              <div className="summary-row"><span>Plan status</span><strong>{optimized ? "Demo updated" : "Awaiting optimization"}</strong></div>
+              <div className="summary-row"><span>Unassigned jobs</span><strong>{unassigned}</strong></div>
+              <div className="summary-row"><span>Jobs in active plan</span><strong>{activeJobs}</strong></div>
+              <div className="summary-note">Final route feasibility, distance and cost require the backend optimizer and approved routing data.</div>
+            </section>
+          </div>
+
+          <footer>Motivus Logistics Optimizer · Prototype v0.1 <span>Sample data · For internal review</span></footer>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function Metric({ label, value, note, icon, tone }: {
+  label: string; value: string; note: string; icon: string; tone: string;
+}) {
+  return (
+    <section className="metric-card">
+      <div className="metric-top"><span>{label}</span><span className={`metric-icon ${tone}`}>{icon}</span></div>
+      <div className="metric-value">{value}</div>
+      <div className="metric-note">{note}</div>
+    </section>
+  );
+}
