@@ -1,0 +1,541 @@
+
+import os
+from collections import defaultdict
+from datetime import date
+from math import ceil, floor
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+
+from app.auth import current_user, router as auth_router
+from app.optimizer import allocate_jobs
+from app.database import engine
+
+app = FastAPI(
+    title="Motivus Logistics API",
+    version="0.2.0",
+    description="Battery pickup and delivery planning with authentication.",
+)
+@app.get("/api/v1/locations")
+def get_locations(user=Depends(current_user)):
+    with engine.connect() as connection:
+        result = connection.execute(
+            text("""
+                SELECT id, code, name, location_type, address,
+                       latitude, longitude
+                FROM locations
+                WHERE is_active = TRUE
+                  AND location_type = 'BRC'
+                ORDER BY name
+            """)
+        )
+
+        locations = [dict(row._mapping) for row in result]
+
+    return {"locations": locations}
+frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[frontend_origin],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+app.include_router(auth_router)
+
+
+class JobInput(BaseModel):
+    id: str
+    weight_kg: int = Field(ge=0)
+
+
+class VehicleInput(BaseModel):
+    id: str
+    capacity_kg: int = Field(ge=0)
+
+
+class VehicleCreate(BaseModel):
+    vehicle_code: str = Field(min_length=1, max_length=50)
+    registration_number: str = Field(min_length=1, max_length=30)
+    driver_name: str = Field(min_length=1, max_length=100)
+    payload_capacity_kg: float = Field(gt=0)
+    availability_status: str = "AVAILABLE"
+
+
+class BatteryCreate(BaseModel):
+    serial_number: str = Field(min_length=1, max_length=100)
+    battery_type_id: int | None = Field(default=None, gt=0)
+    model_number: str | None = Field(default=None, max_length=150)
+    capacity_ah: float | None = Field(default=None, gt=0)
+    condition: str = "UNKNOWN"
+    current_location_id: int | None = Field(default=None, gt=0)
+    warranty_status: str = "UNKNOWN"
+    lifecycle_status: str = "ACTIVE"
+
+class OptimizeRequest(BaseModel):
+    jobs: list[JobInput]
+    vehicles: list[VehicleInput]
+
+
+class GeneratePlanRequest(BaseModel):
+    plan_date: date
+
+
+BATTERY_CONDITIONS = {
+    "GOOD", "FAULTY", "REGENERATED",
+    "REPLACEMENT", "SCRAP", "UNKNOWN",
+}
+
+WARRANTY_STATUSES = {
+    "IN_WARRANTY", "EXPIRED", "CLAIM_PENDING",
+    "REPLACED", "UNKNOWN",
+}
+
+BATTERY_LIFECYCLE_STATUSES = {
+    "ACTIVE", "IN_TRANSIT", "UNDER_PROCESSING", "RETIRED",
+}
+
+
+@app.post("/api/v1/batteries", status_code=201)
+def create_battery(
+    request: BatteryCreate,
+    user=Depends(current_user),
+):
+    serial_number = request.serial_number.strip()
+    condition = request.condition.strip().upper()
+    warranty_status = request.warranty_status.strip().upper()
+    lifecycle_status = request.lifecycle_status.strip().upper()
+    model_number = (
+        request.model_number.strip() if request.model_number else None
+    )
+
+    if not serial_number:
+        raise HTTPException(status_code=422, detail="Serial number is required.")
+
+    if condition not in BATTERY_CONDITIONS:
+        raise HTTPException(status_code=422, detail="Invalid battery condition.")
+
+    if warranty_status not in WARRANTY_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid warranty status.")
+
+    if lifecycle_status not in BATTERY_LIFECYCLE_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid lifecycle status.")
+
+    query = text("""
+        INSERT INTO batteries (
+            serial_number, battery_type_id, model_number, capacity_ah,
+            condition, current_location_id, warranty_status, lifecycle_status
+        )
+        VALUES (
+            :serial_number, :battery_type_id, :model_number, :capacity_ah,
+            :condition, :current_location_id, :warranty_status, :lifecycle_status
+        )
+        RETURNING id, serial_number, battery_type_id, model_number,
+                  capacity_ah, condition, current_location_id,
+                  warranty_status, lifecycle_status, created_at
+    """)
+
+    values = {
+        "serial_number": serial_number,
+        "battery_type_id": request.battery_type_id,
+        "model_number": model_number,
+        "capacity_ah": request.capacity_ah,
+        "condition": condition,
+        "current_location_id": request.current_location_id,
+        "warranty_status": warranty_status,
+        "lifecycle_status": lifecycle_status,
+    }
+
+    try:
+        with engine.begin() as connection:
+            row = connection.execute(query, values).mappings().one()
+        return dict(row)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Serial number already exists, or the selected battery "
+                "type/location does not exist."
+            ),
+        ) from exc
+
+
+@app.get("/api/v1/batteries")
+def get_batteries(
+    search: str | None = None,
+    location_id: int | None = None,
+    condition: str | None = None,
+    lifecycle_status: str | None = None,
+    user=Depends(current_user),
+):
+    conditions = []
+    values = {}
+
+    if search and search.strip():
+        conditions.append("""
+            (
+                b.serial_number ILIKE :search
+                OR COALESCE(b.model_number, '') ILIKE :search
+                OR COALESCE(bt.type_name, '') ILIKE :search
+            )
+        """)
+        values["search"] = f"%{search.strip()}%"
+
+    if location_id is not None:
+        conditions.append("b.current_location_id = :location_id")
+        values["location_id"] = location_id
+
+    if condition:
+        condition = condition.strip().upper()
+        if condition not in BATTERY_CONDITIONS:
+            raise HTTPException(status_code=422, detail="Invalid battery condition.")
+        conditions.append("b.condition = :condition")
+        values["condition"] = condition
+
+    if lifecycle_status:
+        lifecycle_status = lifecycle_status.strip().upper()
+        if lifecycle_status not in BATTERY_LIFECYCLE_STATUSES:
+            raise HTTPException(status_code=422, detail="Invalid lifecycle status.")
+        conditions.append("b.lifecycle_status = :lifecycle_status")
+        values["lifecycle_status"] = lifecycle_status
+
+    where_clause = (
+        "WHERE " + " AND ".join(conditions) if conditions else ""
+    )
+
+    query = text(f"""
+        SELECT
+            b.id,
+            b.serial_number,
+            b.battery_type_id,
+            bt.type_code AS battery_type_code,
+            bt.type_name AS battery_type_name,
+            b.model_number,
+            b.capacity_ah,
+            b.condition,
+            b.current_location_id,
+            l.code AS location_code,
+            l.name AS location_name,
+            b.warranty_status,
+            b.lifecycle_status,
+            b.created_at,
+            b.updated_at
+        FROM batteries b
+        LEFT JOIN battery_types bt ON bt.id = b.battery_type_id
+        LEFT JOIN locations l ON l.id = b.current_location_id
+        {where_clause}
+        ORDER BY b.created_at DESC, b.id DESC
+        LIMIT 500
+    """)
+
+    with engine.connect() as connection:
+        rows = connection.execute(query, values).mappings().all()
+
+    return {
+        "count": len(rows),
+        "batteries": [dict(row) for row in rows],
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "motivus-logistics-api"}
+
+
+@app.post("/api/v1/optimize")
+def optimize(
+    request: OptimizeRequest,
+    user=Depends(current_user),
+):
+    try:
+        return allocate_jobs(
+            jobs=[job.model_dump() for job in request.jobs],
+            vehicles=[vehicle.model_dump() for vehicle in request.vehicles],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/planning/generate")
+def generate_daily_plan(
+    request: GeneratePlanRequest,
+    user=Depends(current_user),
+):
+    with engine.begin() as connection:
+        # Serialize plan generation for the same operating date.
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"motivus-plan-{request.plan_date}"},
+        )
+
+        jobs = connection.execute(
+            text("""
+                SELECT id, job_code, battery_quantity, total_weight_kg
+                FROM jobs
+                WHERE operating_date = :plan_date
+                  AND status IN ('UNASSIGNED', 'ASSIGNED')
+                ORDER BY id
+            """),
+            {"plan_date": request.plan_date},
+        ).mappings().all()
+
+        if not jobs:
+            raise HTTPException(
+                status_code=404,
+                detail="No eligible jobs found for this planning date.",
+            )
+
+        vehicles = connection.execute(
+            text("""
+                SELECT id, vehicle_code, payload_capacity_kg
+                FROM vehicles
+                WHERE is_active = TRUE
+                  AND availability_status = 'AVAILABLE'
+                ORDER BY vehicle_code
+            """)
+        ).mappings().all()
+
+        if not vehicles:
+            raise HTTPException(
+                status_code=409,
+                detail="No available vehicles found.",
+            )
+
+        jobs_by_id = {str(job["id"]): job for job in jobs}
+        vehicles_by_id = {
+            str(vehicle["id"]): vehicle for vehicle in vehicles
+        }
+
+        optimizer_jobs = [
+            {
+                "id": str(job["id"]),
+                "weight_kg": ceil(float(job["total_weight_kg"])),
+            }
+            for job in jobs
+        ]
+
+        optimizer_vehicles = [
+            {
+                "id": str(vehicle["id"]),
+                "capacity_kg": floor(
+                    float(vehicle["payload_capacity_kg"])
+                ),
+            }
+            for vehicle in vehicles
+        ]
+
+        try:
+            result = allocate_jobs(
+                jobs=optimizer_jobs,
+                vehicles=optimizer_vehicles,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=str(exc)
+            ) from exc
+
+        # Enforce the maximum of 25 batteries per vehicle.
+        battery_load = defaultdict(int)
+        accepted_assignments = []
+
+        for assignment in result["assignments"]:
+            job_id = str(assignment["job_id"])
+            vehicle_id = str(assignment["vehicle_id"])
+
+            job = jobs_by_id.get(job_id)
+            vehicle = vehicles_by_id.get(vehicle_id)
+
+            if job is None or vehicle is None:
+                continue
+
+            quantity = int(job["battery_quantity"])
+
+            if quantity < 0 or battery_load[vehicle_id] + quantity > 25:
+                continue
+
+            battery_load[vehicle_id] += quantity
+
+            accepted_assignments.append({
+                "job_id": job_id,
+                "job_code": job["job_code"],
+                "vehicle_id": vehicle_id,
+                "vehicle_code": vehicle["vehicle_code"],
+                "battery_quantity": quantity,
+                "weight_kg": float(job["total_weight_kg"]),
+            })
+
+        assigned_by_job = {
+            item["job_id"]: item for item in accepted_assignments
+        }
+
+        unassigned_job_ids = []
+
+        for job in jobs:
+            job_id = str(job["id"])
+            assignment = assigned_by_job.get(job_id)
+
+            if assignment:
+                connection.execute(
+                    text("""
+                        UPDATE jobs
+                        SET assigned_vehicle_id = :vehicle_id,
+                            status = 'ASSIGNED'
+                        WHERE id = :job_id
+                    """),
+                    {
+                        "vehicle_id": int(assignment["vehicle_id"]),
+                        "job_id": job["id"],
+                    },
+                )
+            else:
+                unassigned_job_ids.append(job_id)
+                connection.execute(
+                    text("""
+                        UPDATE jobs
+                        SET assigned_vehicle_id = NULL,
+                            status = 'UNASSIGNED'
+                        WHERE id = :job_id
+                    """),
+                    {"job_id": job["id"]},
+                )
+
+        next_version = connection.execute(
+            text("""
+                SELECT COALESCE(MAX(version), 0) + 1
+                FROM route_plans
+                WHERE plan_date = :plan_date
+            """),
+            {"plan_date": request.plan_date},
+        ).scalar_one()
+
+        plan_id = connection.execute(
+            text("""
+                INSERT INTO route_plans (plan_date, version, status)
+                VALUES (:plan_date, :version, 'DRAFT')
+                RETURNING id
+            """),
+            {
+                "plan_date": request.plan_date,
+                "version": next_version,
+            },
+        ).scalar_one()
+
+    return {
+        "status": "success",
+        "plan_id": plan_id,
+        "plan_date": request.plan_date,
+        "version": next_version,
+        "plan_status": "DRAFT",
+        "assigned_count": len(accepted_assignments),
+        "unassigned_count": len(unassigned_job_ids),
+        "assignments": accepted_assignments,
+        "unassigned_job_ids": unassigned_job_ids,
+        "message": (
+            "Vehicle allocation saved. Road routing and route stops "
+            "are not generated by this version."
+        ),
+    }
+
+
+@app.post("/api/v1/vehicles", status_code=201)
+def create_vehicle(
+    request: VehicleCreate,
+    user=Depends(current_user),
+):
+    status = request.availability_status.strip().upper()
+    allowed_statuses = {
+        "AVAILABLE", "IN_USE", "MAINTENANCE", "UNAVAILABLE"
+    }
+
+    if status not in allowed_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Availability status must be one of: "
+                + ", ".join(sorted(allowed_statuses))
+            ),
+        )
+
+    query = text("""
+        INSERT INTO vehicles (
+            vehicle_code, registration_number, driver_name,
+            payload_capacity_kg, availability_status
+        )
+        VALUES (
+            :vehicle_code, :registration_number, :driver_name,
+            :payload_capacity_kg, :availability_status
+        )
+        RETURNING id, vehicle_code, registration_number, driver_name,
+                  payload_capacity_kg, availability_status, is_active
+    """)
+
+    values = {
+        "vehicle_code": request.vehicle_code.strip(),
+        "registration_number": request.registration_number.strip().upper(),
+        "driver_name": request.driver_name.strip(),
+        "payload_capacity_kg": request.payload_capacity_kg,
+        "availability_status": status,
+    }
+
+    try:
+        with engine.begin() as connection:
+            row = connection.execute(query, values).mappings().one()
+        return dict(row)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Vehicle code or registration number already exists.",
+        ) from exc
+
+
+@app.get("/api/v1/dashboard")
+def get_dashboard(user=Depends(current_user)):
+    with engine.connect() as connection:
+        vehicles = connection.execute(text("""
+            SELECT id, vehicle_code, registration_number, driver_name,
+                   payload_capacity_kg, availability_status, is_active
+            FROM vehicles
+            ORDER BY vehicle_code
+        """)).mappings().all()
+
+        jobs = connection.execute(text("""
+            SELECT j.id, j.job_code, j.operating_date, j.job_type,
+                   j.battery_quantity, j.total_weight_kg, j.status,
+                   pickup.name AS pickup_location,
+                   delivery.name AS delivery_location,
+                   v.vehicle_code AS assigned_vehicle
+            FROM jobs j
+            JOIN locations pickup ON pickup.id = j.pickup_location_id
+            JOIN locations delivery ON delivery.id = j.delivery_location_id
+            LEFT JOIN vehicles v ON v.id = j.assigned_vehicle_id
+            ORDER BY j.operating_date, j.job_code
+        """)).mappings().all()
+
+    vehicle_data = [dict(row) for row in vehicles]
+    job_data = [dict(row) for row in jobs]
+
+    return {
+        "source": "postgresql",
+        "planning_status": "NO_DATA" if not job_data else "DRAFT",
+        "metrics": {
+            "total_jobs": len(job_data),
+            "total_vehicles": len(vehicle_data),
+            "active_vehicles": sum(
+                1 for vehicle in vehicle_data if vehicle["is_active"]
+            ),
+            "unassigned_jobs": sum(
+                1 for job in job_data
+                if job["status"].upper() == "UNASSIGNED"
+            ),
+            "completed_jobs": sum(
+                1 for job in job_data
+                if job["status"].upper() == "COMPLETED"
+            ),
+        },
+        "vehicles": vehicle_data,
+        "jobs": job_data,
+    }

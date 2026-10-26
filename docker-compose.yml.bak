@@ -1,0 +1,23 @@
+
+services:
+  db:
+    image: postgres:16
+    container_name: motivus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: motivus_logistics
+      POSTGRES_USER: motivus_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your .env file}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U motivus_user -d motivus_logistics"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
